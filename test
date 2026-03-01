@@ -1,0 +1,784 @@
+==============================================================================================================
+						Задание 1
+==============================================================================================================
+--Операция зачисления/списания
+DELIMITER $$
+
+CREATE PROCEDURE payment.sp_user_operation (
+    IN p_id_user INT UNSIGNED,              -- ID пользователя
+    IN p_amount DECIMAL(19,2),              -- Сумма операции в валюте пользователя
+    IN p_id_type_oper SMALLINT UNSIGNED     -- ID типа операции
+)
+BEGIN
+    DECLARE v_direction TINYINT;
+    DECLARE v_balance_before DECIMAL(19,2);  -- Баланс до выполнения операции
+    DECLARE v_balance_after DECIMAL(19,2);   -- Баланс после выполнения операции
+
+    -- Обработчик ошибок: при любой SQL-ошибке откатываем транзакцию
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    -- Проверка корректности суммы
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Сумма операции должна быть больше 0';
+    END IF;
+
+    START TRANSACTION;
+
+    -- Получаем направление операции из справочника типов операций
+    SELECT direction
+      INTO v_direction
+      FROM payment.type_opers
+     WHERE id_type_oper = p_id_type_oper;
+
+    -- Проверяем, что тип операции существует
+    IF v_direction IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Некорректный тип операции';
+    END IF;
+
+    -- Блокируем строку пользователя
+    SELECT user_balance
+      INTO v_balance_before
+      FROM payment.users
+     WHERE id_user = p_id_user
+     FOR UPDATE;
+
+    -- Проверяем, что пользователь существует
+    IF v_balance_before IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Пользователь не найден';
+    END IF;
+
+    -- Если операция списания, проверяем достаточность средств
+    IF v_direction = -1 AND v_balance_before < p_amount THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Недостаточно средств';
+    END IF;
+
+    -- Рассчитываем новый баланс
+    SET v_balance_after = v_balance_before + (p_amount * v_direction);
+
+    -- Обновляем баланс пользователя
+    UPDATE payment.users
+       SET user_balance = v_balance_after
+     WHERE id_user = p_id_user;
+
+    -- Запись операции
+    INSERT INTO payment.user_operations
+        (dt, id_user, id_type_oper, direction, amount_oper)
+    VALUES
+        (UTC_TIMESTAMP(), p_id_user, p_id_type_oper, v_direction, p_amount);
+
+    -- Записываем лог действия пользователя
+    INSERT INTO payment.log_users
+        (dt, idUser, idAction, Params)
+    VALUES
+        (
+            UTC_TIMESTAMP(),
+            p_id_user,
+            IF(v_direction = 1, 1, 2),  -- 1 = пополнение, 2 = списание
+            JSON_OBJECT(
+                'amount', p_amount,
+                'type_oper', p_id_type_oper,
+                'direction', v_direction,
+                'balance_before', v_balance_before,
+                'balance_after', v_balance_after
+            )
+        );
+    COMMIT;
+
+    -- Возвращаем результат выполнения
+    SELECT
+        'Успех' AS status,
+        v_balance_before AS balance_before,
+        v_balance_after  AS balance_after;
+
+END $$
+
+DELIMITER ;
+
+1) Добавляем индексы иначе чтение таблицы при миллиардах записей будет создавать серьезную нагрузку на БД.
+
+Индексы на Операции пользователей:
+Покрывает фильтрацию по дате и группировку по типу операции, а также соединение с users. Для заданий 2,3,4
+CREATE INDEX idx_user_operations_dt_type_user ON payment.user_operations (dt, id_type_oper, id_user);
+
+Оптимизирует отчёт по конкретному пользователю за период. Для задания 5
+CREATE INDEX idx_user_operations_user_dt ON payment.user_operations (id_user, dt);
+
+2) Разделеть архетикуру на OLTP и OLAP. 
+ OLTP - Обработки транзакций оставить в MySql, т.е процедуру payment.sp_user_operation.
+ OLAP - Отчетность строить на ClickHouse или Greenplum, отчетность будет строится быстрее с учетом MPP-архитектуры и колоночным хранение данных.
+	Или строить отчетность на реплике (MySql) что бы снять нагрузку с мастера.
+
+
+==============================================================================================================
+						Задание 2
+==============================================================================================================
+
+DELIMITER $$
+
+CREATE PROCEDURE payment.sp_financial_report (
+    IN p_from DATETIME,                 -- Начало периода (в переданном часовом поясе)
+    IN p_to DATETIME,                   -- Конец периода (в переданном часовом поясе)
+    IN p_country_id SMALLINT UNSIGNED,  -- Опциональный фильтр по стране
+    IN p_type_oper_id SMALLINT UNSIGNED,-- Опциональный фильтр по типу операции
+    IN p_tz VARCHAR(50)                 -- Часовой пояс входных дат
+)
+BEGIN
+
+  DECLARE v_from_utc DATETIME;
+  DECLARE v_to_utc   DATETIME;
+
+  -- ВАЛИДАЦИЯ ПАРАМЕТРОВ
+
+  -- Проверяем корректность диапазона
+  IF p_from IS NULL OR p_to IS NULL OR p_from > p_to THEN
+      SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Некорректный период дат';
+  END IF;
+
+  -- Если таймзона не передана — считаем, что вход в UTC
+  IF p_tz IS NULL OR p_tz = '' THEN
+      SET p_tz = 'UTC';
+  END IF;
+
+  -- Если передана только дата без времени,
+  -- считаем период до конца дня (полуоткрытый интервал)
+  IF TIME(p_to) = '00:00:00' THEN
+      SET p_to = DATE_ADD(p_to, INTERVAL 1 DAY);
+  END IF;
+
+  /*
+  ============================================================
+  Входные даты конвертируем в UTC,
+  чтобы корректно фильтровать user_operations.
+  ============================================================
+  */
+
+  SET v_from_utc = CONVERT_TZ(p_from, p_tz, 'UTC');
+  SET v_to_utc   = CONVERT_TZ(p_to,   p_tz, 'UTC');
+
+  /*
+  ============================================================
+  Используем dynamic SQL, чтобы:
+  - не использовать OR
+  - сохранить возможность использования индексов
+  ============================================================
+  */
+
+  SET @sql = CONCAT(
+    'SELECT
+        CASE WHEN GROUPING(c.name_country)=1 THEN ''TOTAL:'' ELSE c.name_country END AS country_name,
+        CASE WHEN GROUPING(t.name_oper)=1 THEN ''TOTAL:'' ELSE t.name_oper END AS oper_name,
+        ROUND(SUM(x.amount_rub),2) AS amount_rub,
+        ROUND(SUM(x.amount_comiss_rub),2) AS amount_comiss_rub,
+        ROUND(SUM(x.amount_no_comiss_rub),2) AS amount_no_comiss_rub
+     FROM (
+         SELECT
+             u.id_country,
+             uo.id_type_oper,
+
+             -- Переводим сумму операции в рубли
+             SUM(uo.amount_oper / cur.base_rate) AS amount_rub,
+
+             -- Рассчитываем комиссию в рублях
+             SUM((uo.amount_oper / cur.base_rate) * t.commission / 100) AS amount_comiss_rub,
+
+             -- Сумма без комиссии
+             SUM(uo.amount_oper / cur.base_rate)
+               - SUM((uo.amount_oper / cur.base_rate) * t.commission / 100) AS amount_no_comiss_rub
+
+         FROM payment.user_operations uo
+         JOIN payment.users u ON u.id_user = uo.id_user
+         JOIN payment.type_opers t ON t.id_type_oper = uo.id_type_oper
+         JOIN payment.currencies cur ON cur.id_currency = u.id_currency
+
+         WHERE uo.dt >= ''', v_from_utc, '''
+           AND uo.dt <  ''', v_to_utc, ''''
+  );
+
+  -- Добавляем фильтры только если они переданы
+  IF p_country_id IS NOT NULL THEN
+      SET @sql = CONCAT(@sql, ' AND u.id_country = ', p_country_id);
+  END IF;
+
+  IF p_type_oper_id IS NOT NULL THEN
+      SET @sql = CONCAT(@sql, ' AND uo.id_type_oper = ', p_type_oper_id);
+  END IF;
+
+  /*
+  ============================================================
+  ФИНАЛЬНАЯ АГРЕГАЦИЯ 
+  GROUP BY + WITH ROLLUP:
+  - итоги по каждой стране
+  - общий итог
+  ============================================================
+  */
+
+  SET @sql = CONCAT(@sql,
+        ' GROUP BY u.id_country, uo.id_type_oper
+      ) x
+      JOIN payment.countries c ON c.id_country = x.id_country
+      JOIN payment.type_opers t ON t.id_type_oper = x.id_type_oper
+      GROUP BY c.name_country, t.name_oper WITH ROLLUP
+      ORDER BY
+        GROUPING(c.name_country),
+        c.name_country,
+        GROUPING(t.name_oper),
+        t.name_oper'
+    );
+
+  PREPARE stmt FROM @sql;
+  EXECUTE stmt;
+  DEALLOCATE PREPARE stmt;
+
+END$$
+DELIMITER ;
+
+==============================================================================================================
+						Задание 3
+==============================================================================================================
+
+--Таблица дневной консолидации, для хранения агрегатов
+CREATE TABLE payment.daily_financial_agg (
+    agg_date DATE NOT NULL,
+    id_country SMALLINT UNSIGNED NOT NULL,
+    id_type_oper SMALLINT UNSIGNED NOT NULL,
+    amount_rub DECIMAL(19,2) NOT NULL,
+    amount_commission_rub DECIMAL(19,2) NOT NULL,
+    amount_no_commission_rub DECIMAL(19,2) NOT NULL,
+    cnt_operations BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (agg_date, id_country, id_type_oper)
+) ENGINE=InnoDB;
+
+--Процедура агрегации данных
+DELIMITER $$
+
+CREATE PROCEDURE payment.sp_aggregate(IN p_date DATE)
+BEGIN
+
+    DECLARE v_last_date DATE;
+    DECLARE v_target_date DATE;
+    DECLARE v_current_date DATE;
+
+    /*
+    ============================================================
+    ОПРЕДЕЛЯЕМ РЕЖИМ РАБОТЫ
+    - Если передана дата то ручной режим
+    - Если NULL то режим EVENT (самовосстановление)
+    ============================================================
+    */
+
+    IF p_date IS NOT NULL THEN
+        SET v_current_date = p_date;
+        SET v_target_date  = p_date;
+
+    ELSE
+        -- Берём последнюю агрегированную дату
+        SELECT MAX(agg_date)
+          INTO v_last_date
+          FROM payment.daily_financial_agg;
+
+        -- Если агрегатов нет — стартуем с минимальной даты операций
+        IF v_last_date IS NULL THEN
+            SELECT DATE_SUB(DATE(MIN(dt)), INTERVAL 1 DAY)
+              INTO v_last_date
+              FROM payment.user_operations;
+        END IF;
+
+        -- Следующий день после последней агрегированной даты
+        SET v_current_date = DATE_ADD(v_last_date, INTERVAL 1 DAY);
+
+        -- Агрегируем до вчерашнего дня включительно
+        SET v_target_date  = CURRENT_DATE - INTERVAL 1 DAY;
+    END IF;
+
+    /*
+    ============================================================
+    ЦИКЛ ПО ДНЯМ
+    Обрабатываем все пропущенные дни
+    ============================================================
+    */
+
+    WHILE v_current_date IS NOT NULL
+          AND v_current_date <= v_target_date DO
+
+        /*
+        ========================================================
+        АГРЕГАЦИЯ ЗА ОДИН ДЕНЬ
+        ========================================================
+        */
+
+        INSERT INTO payment.daily_financial_agg (
+            agg_date,
+            id_country,
+            id_type_oper,
+            amount_rub,
+            amount_commission_rub,
+            amount_no_commission_rub,
+            cnt_operations
+        )
+        SELECT
+            v_current_date,
+            u.id_country,
+            uo.id_type_oper,
+
+            ROUND(SUM(uo.amount_oper / cur.base_rate),2),
+
+            ROUND(SUM((uo.amount_oper / cur.base_rate) * t.commission / 100),2),
+
+            ROUND(
+                SUM(uo.amount_oper / cur.base_rate)
+                - SUM((uo.amount_oper / cur.base_rate) * t.commission / 100)
+            ,2),
+
+            COUNT(*)
+
+        FROM payment.user_operations uo
+        JOIN payment.users u ON u.id_user = uo.id_user
+        JOIN payment.type_opers t ON t.id_type_oper = uo.id_type_oper
+        JOIN payment.currencies cur ON cur.id_currency = u.id_currency
+
+        WHERE uo.dt >= v_current_date
+          AND uo.dt < DATE_ADD(v_current_date, INTERVAL 1 DAY)
+
+        GROUP BY u.id_country, uo.id_type_oper
+
+        /*
+        ========================================================
+        ИДЕМПОТЕНТНОСТЬ:
+        Если запись за день уже есть — обновляем её.
+        Это безопасный перезапуск процедуры.
+        ========================================================
+        */
+        ON DUPLICATE KEY UPDATE
+            amount_rub = VALUES(amount_rub),
+            amount_commission_rub = VALUES(amount_commission_rub),
+            amount_no_commission_rub = VALUES(amount_no_commission_rub),
+            cnt_operations = VALUES(cnt_operations);
+
+        SET v_current_date = DATE_ADD(v_current_date, INTERVAL 1 DAY);
+
+    END WHILE;
+
+END$$
+DELIMITER ;
+
+--EVENT: ежедневная агрегация финансовых данных
+CREATE EVENT payment.ev_daily_aggregation
+ON SCHEDULE EVERY 1 DAY
+ /* 
+ ============================================================
+ Время первого запуска:
+ CURRENT_DATE + 1 день = завтрашняя дата (00:00)
+ + 3 часа = 03:00
+ Таким образом, агрегируем предыдущий день,
+ когда он уже полностью завершён.
+ ============================================================
+ */
+STARTS TIMESTAMP(CURRENT_DATE + INTERVAL 1 DAY) + INTERVAL 3 HOUR
+DO
+CALL payment.sp_aggregate(NULL);
+
+==============================================================================================================
+						Задание 4
+==============================================================================================================
+
+DELIMITER $$
+
+CREATE PROCEDURE payment.sp_report_period(
+    IN p_from DATETIME,   -- начало периода (UTC)
+    IN p_to   DATETIME    -- конец периода (UTC)
+)
+BEGIN
+
+    DECLARE v_start_day DATE;  -- дата начала (без времени)
+    DECLARE v_end_day   DATE;  -- дата конца (без времени)
+
+    --Валидация
+    IF p_from IS NULL OR p_to IS NULL OR p_from >= p_to THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Недопустимый диапазон дат';
+    END IF;
+
+    SET v_start_day = DATE(p_from);
+    SET v_end_day   = DATE(p_to);
+
+    /*
+    ============================================================
+    ЕСЛИ ПЕРИОД ВНУТРИ ОДНОГО ДНЯ
+    Использовать агрегаты нельзя — день неполный.
+    Считаем только из сырых данных.
+    ============================================================
+    */
+    IF v_start_day = v_end_day THEN
+
+        SELECT
+            CASE WHEN GROUPING(c.name_country)=1 THEN 'TOTAL:' ELSE c.name_country END AS country_name,
+            CASE WHEN GROUPING(t.name_oper)=1 THEN 'TOTAL:' ELSE t.name_oper END AS oper_name,
+
+            -- Конвертация в рубли
+            ROUND(SUM(uo.amount_oper / cur.base_rate),2) AS amount,
+
+            -- Комиссия
+            ROUND(SUM((uo.amount_oper / cur.base_rate) * t.commission / 100),2) AS amount_comiss,
+
+            -- Без комиссии
+            ROUND(
+                SUM(uo.amount_oper / cur.base_rate)
+                - SUM((uo.amount_oper / cur.base_rate) * t.commission / 100)
+            ,2) AS amount_no_comiss
+
+        FROM payment.user_operations uo
+        JOIN payment.users u ON u.id_user = uo.id_user
+        JOIN payment.type_opers t ON t.id_type_oper = uo.id_type_oper
+        JOIN payment.currencies cur ON cur.id_currency = u.id_currency
+        JOIN payment.countries c ON c.id_country = u.id_country
+
+        WHERE uo.dt >= p_from
+          AND uo.dt < p_to
+
+        GROUP BY c.name_country, t.name_oper WITH ROLLUP;
+
+    ELSE
+
+        /*
+        ============================================================
+        ПЕРИОД БОЛЬШЕ ОДНОГО ДНЯ
+        Используем гибридную стратегию:
+
+        - начальный хвост  из user_operations
+        - полные дни из агрегаты
+        - конечный хвост из  user_operations
+        ============================================================
+        */
+
+        SELECT
+            CASE WHEN GROUPING(c.name_country)=1 THEN 'TOTAL:' ELSE c.name_country END AS country_name,
+            CASE WHEN GROUPING(t.name_oper)=1 THEN 'TOTAL:' ELSE t.name_oper END AS oper_name,
+
+            ROUND(SUM(x.amount_rub),2) AS amount,
+            ROUND(SUM(x.amount_commission_rub),2) AS amount_comiss,
+            ROUND(SUM(x.amount_no_commission_rub),2) AS amount_no_comiss
+
+        FROM
+        (
+
+            /*
+            --------------------------------------------------------
+            НАЧАЛЬНЫЙ ХВОСТ
+            От p_from до конца первого дня
+            --------------------------------------------------------
+            */
+            SELECT
+                u.id_country,
+                uo.id_type_oper,
+                SUM(uo.amount_oper / cur.base_rate) AS amount_rub,
+                SUM((uo.amount_oper / cur.base_rate) * t.commission / 100) AS amount_commission_rub,
+                SUM(uo.amount_oper / cur.base_rate)
+                  - SUM((uo.amount_oper / cur.base_rate) * t.commission / 100)
+                  AS amount_no_commission_rub
+            FROM payment.user_operations uo
+            JOIN payment.users u ON u.id_user = uo.id_user
+            JOIN payment.type_opers t ON t.id_type_oper = uo.id_type_oper
+            JOIN payment.currencies cur ON cur.id_currency = u.id_currency
+            WHERE uo.dt >= p_from
+              AND uo.dt < DATE_ADD(v_start_day, INTERVAL 1 DAY)
+            GROUP BY u.id_country, uo.id_type_oper
+
+            UNION ALL
+
+            /*
+            --------------------------------------------------------
+            ПОЛНЫЕ ДНИ
+            Берём из таблицы консолидации
+            --------------------------------------------------------
+            */
+            SELECT
+                id_country,
+                id_type_oper,
+                amount_rub,
+                amount_commission_rub,
+                amount_no_commission_rub
+            FROM payment.daily_financial_agg
+            WHERE agg_date > v_start_day
+              AND agg_date < v_end_day
+
+            UNION ALL
+
+            /*
+            --------------------------------------------------------
+            КОНЕЧНЫЙ ХВОСТ
+            От начала последнего дня до p_to
+            --------------------------------------------------------
+            */
+            SELECT
+                u.id_country,
+                uo.id_type_oper,
+                SUM(uo.amount_oper / cur.base_rate),
+                SUM((uo.amount_oper / cur.base_rate) * t.commission / 100),
+                SUM(uo.amount_oper / cur.base_rate)
+                  - SUM((uo.amount_oper / cur.base_rate) * t.commission / 100)
+            FROM payment.user_operations uo
+            JOIN payment.users u ON u.id_user = uo.id_user
+            JOIN payment.type_opers t ON t.id_type_oper = uo.id_type_oper
+            JOIN payment.currencies cur ON cur.id_currency = u.id_currency
+            WHERE uo.dt >= v_end_day
+              AND uo.dt < p_to
+            GROUP BY u.id_country, uo.id_type_oper
+
+        ) x
+
+        JOIN payment.countries c ON c.id_country = x.id_country
+        JOIN payment.type_opers t ON t.id_type_oper = x.id_type_oper
+
+        GROUP BY c.name_country, t.name_oper WITH ROLLUP;
+
+    END IF;
+
+END $$
+
+DELIMITER ;
+
+==============================================================================================================
+						Задание 5
+==============================================================================================================
+
+DELIMITER $$
+
+CREATE PROCEDURE payment.sp_user_report(
+    IN p_user_id INT,
+    IN p_from DATETIME,
+    IN p_to   DATETIME,
+    IN p_currency_id INT   -- NULL = RUB
+)
+BEGIN
+
+    DECLARE v_target_rate DECIMAL(18,8);
+    DECLARE v_exists INT;
+
+
+    --ВАЛИДАЦИЯ ПАРАМЕТРОВ
+    IF p_user_id IS NULL 
+       OR p_from IS NULL 
+       OR p_to IS NULL 
+       OR p_from >= p_to THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Некорректные входные параметры';
+    END IF;
+
+    /*
+    ============================================================
+    ОПРЕДЕЛЕНИЕ ЦЕЛЕВОЙ ВАЛЮТЫ
+    По умолчанию — RUB (base_rate = 1)
+    ============================================================
+    */
+    IF p_currency_id IS NULL THEN
+        SET v_target_rate = 1;
+    ELSE
+
+        -- Проверяем существование валюты
+        SELECT COUNT(*)
+        INTO v_exists
+        FROM payment.currencies
+        WHERE id_currency = p_currency_id;
+
+        IF v_exists = 0 THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Валюта не найдена';
+        END IF;
+
+        -- Получаем курс целевой валюты
+        SELECT base_rate
+        INTO v_target_rate
+        FROM payment.currencies
+        WHERE id_currency = p_currency_id;
+
+    END IF;
+
+    /*
+    ============================================================
+    ЛОГИКА КОНВЕРТАЦИИ
+    Формула:
+        RUB = amount / base_rate
+        target = RUB * v_target_rate
+    ============================================================
+    */
+
+    SELECT
+        CASE 
+            WHEN GROUPING(t.name_oper)=1 THEN 'TOTAL:' 
+            ELSE t.name_oper 
+        END AS oper_name,
+
+        ROUND(SUM(base_amount),2) AS amount,
+
+        ROUND(SUM(base_amount * t.commission / 100),2) 
+            AS amount_commission,
+
+        ROUND(
+            SUM(base_amount - base_amount * t.commission / 100)
+        ,2) AS amount_no_commission
+
+    FROM
+    (
+        SELECT
+            uo.id_type_oper,
+
+            -- Переводим в RUB, затем в целевую валюту
+            (uo.amount_oper / cur.base_rate) * v_target_rate AS base_amount
+
+        FROM payment.user_operations uo
+        JOIN payment.users u ON u.id_user = uo.id_user
+        JOIN payment.currencies cur ON cur.id_currency = u.id_currency
+
+        WHERE uo.id_user = p_user_id
+          AND uo.dt >= p_from
+          AND uo.dt <  p_to
+
+    ) x
+
+    JOIN payment.type_opers t 
+        ON t.id_type_oper = x.id_type_oper
+
+    GROUP BY t.name_oper WITH ROLLUP;
+
+END $$
+
+DELIMITER ;
+
+==============================================================================================================
+						Задание 6
+==============================================================================================================
+
+--Меням тип dt c TIMESTAMP на DATETIME(6), иначе с типом TIMESTAMP нельзя создать партиции тиапа RANGE COLUMNS
+ALTER TABLE payment.log_users
+MODIFY dt DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6);
+
+--Перевод таблицы на партиции.
+ALTER TABLE payment.log_users
+PARTITION BY RANGE COLUMNS(dt) (
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+
+--Процедура ротации
+DELIMITER $$
+
+CREATE PROCEDURE payment.sp_rotate_log_partitions()
+BEGIN
+    DECLARE v_today DATE;
+    DECLARE v_keep_from DATE;
+    DECLARE v_date DATE;
+    DECLARE v_partition_name VARCHAR(20);
+    DECLARE v_partitions_to_drop TEXT;
+    DECLARE v_exists INT DEFAULT 0;
+
+    /*
+    ============================================================
+    ОПРЕДЕЛЯЕМ ГРАНИЦЫ ХРАНЕНИЯ
+    Храним последние 7 завершённых дней.
+    ============================================================
+    */
+
+    SET v_today      = CURDATE();
+    SET v_keep_from  = DATE_SUB(v_today, INTERVAL 7 DAY);
+
+    /*
+    ============================================================
+    УДАЛЕНИЕ СТАРЫХ ПАРТИЦИЙ
+    Формируем список партиций старше допустимой даты.
+    ============================================================
+    */
+
+    SELECT GROUP_CONCAT(partition_name ORDER BY partition_name SEPARATOR ',')
+    INTO v_partitions_to_drop
+    FROM information_schema.PARTITIONS
+    WHERE table_schema = 'payment'
+      AND table_name = 'log_users'
+      AND partition_name IS NOT NULL
+      AND partition_name <> 'p_future'
+      AND partition_name < CONCAT('p', DATE_FORMAT(v_keep_from, '%Y%m%d'));
+
+    IF v_partitions_to_drop IS NOT NULL THEN
+
+        SET @sql = CONCAT(
+            'ALTER TABLE payment.log_users DROP PARTITION ',
+            v_partitions_to_drop
+        );
+
+        PREPARE stmt FROM @sql;
+        EXECUTE stmt;
+        DEALLOCATE PREPARE stmt;
+
+    END IF;
+
+    /*
+    ============================================================
+    ДОБАВЛЕНИЕ ПАРТИЦИЙ НА СЕГОДНЯ И +2 ДНЯ
+    Это обеспечивает автoвосстановление после простоя.
+    ============================================================
+    */
+
+    SET v_date = v_today;
+
+    WHILE v_date <= DATE_ADD(v_today, INTERVAL 2 DAY) DO
+
+        SET v_partition_name = CONCAT('p', DATE_FORMAT(v_date, '%Y%m%d'));
+
+        SELECT COUNT(*)
+        INTO v_exists
+        FROM information_schema.PARTITIONS
+        WHERE table_schema = 'payment'
+          AND table_name = 'log_users'
+          AND partition_name = v_partition_name;
+
+        IF v_exists = 0 THEN
+
+            
+            --"вырезаем" диапазон из future и создаём конкретную дневную партицию
+            
+            SET @sql = CONCAT(
+                'ALTER TABLE payment.log_users ',
+                'REORGANIZE PARTITION p_future INTO (',
+                    'PARTITION ', v_partition_name,
+                    ' VALUES LESS THAN (''',
+                    DATE_FORMAT(DATE_ADD(v_date, INTERVAL 1 DAY), '%Y-%m-%d'),
+                    '''),',
+                    'PARTITION p_future VALUES LESS THAN (MAXVALUE)',
+                ')'
+            );
+
+            PREPARE stmt FROM @sql;
+            EXECUTE stmt;
+            DEALLOCATE PREPARE stmt;
+
+        END IF;
+
+        SET v_date = DATE_ADD(v_date, INTERVAL 1 DAY);
+
+    END WHILE;
+
+END $$
+
+DELIMITER ;
+
+
+--EVENT: ежедневная ротация партиций логов
+CREATE EVENT IF NOT EXISTS payment.ev_rotate_log_partitions
+ON SCHEDULE EVERY 1 DAY
+ /*
+ ============================================================
+ Первый запуск: завтра в 02:00
+ CURRENT_DATE + 1 день → 00:00 следующего дня
+ + 2 часа → 02:00
+ ============================================================
+ */
+STARTS (CURRENT_DATE + INTERVAL 1 DAY) + INTERVAL 2 HOUR
+DO
+CALL payment.sp_rotate_log_partitions();
